@@ -6,9 +6,11 @@ import {
   ChevronRight,
   Eraser,
   Loader2,
+  ScanText,
   SquareDashed,
   X,
 } from "lucide-react"
+import type { LucideIcon } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 import type {
   PDFDocumentLoadingTask,
@@ -26,11 +28,54 @@ const MAX_PAGE_WIDTH = 1400
 /** Drags shorter than this are treated as a stray click, not a rectangle. */
 const MIN_REGION_PX = 8
 
+/** What a drawn rectangle is for. */
+type RegionKind = "ignore" | "capture"
+
 /**
- * A rectangle covering content the reader should skip — title blocks, legends,
- * revision tables. Stored as fractions of the page so it survives resizing.
+ * A rectangle over part of the page: either content the reader should skip —
+ * title blocks, legends, revision tables — or text that should be pulled out
+ * of the plan. Stored as fractions of the page so it survives resizing.
  */
-type Region = { id: string; x: number; y: number; w: number; h: number }
+type Region = {
+  id: string
+  kind: RegionKind
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+/** Wording and colours per kind. Classes are spelled out so Tailwind keeps them. */
+const KINDS: Record<
+  RegionKind,
+  {
+    icon: LucideIcon
+    label: string
+    hint: string
+    remove: string
+    box: string
+    handle: string
+  }
+> = {
+  ignore: {
+    icon: SquareDashed,
+    label: "Ignore areas",
+    hint: "Drag over content to ignore",
+    remove: "Remove ignored area",
+    box: "border-red-500 bg-red-500/10",
+    handle: "bg-red-500 hover:bg-red-600",
+  },
+  capture: {
+    icon: ScanText,
+    label: "Capture text",
+    hint: "Drag over text to capture",
+    remove: "Remove captured area",
+    box: "border-green-500 bg-green-500/10",
+    handle: "bg-green-500 hover:bg-green-600",
+  },
+}
+
+const KIND_ORDER = Object.keys(KINDS) as RegionKind[]
 
 type Props = { url: string; name: string }
 
@@ -48,7 +93,8 @@ const FloorplanViewer = ({ url, name }: Props) => {
   const [draft, setDraft] = useState("1")
   const [width, setWidth] = useState(0)
   const [error, setError] = useState<string | null>(null)
-  const [marking, setMarking] = useState(false)
+  /** Which kind of rectangle the pointer draws, or null when just reading. */
+  const [mode, setMode] = useState<RegionKind | null>(null)
   const [regions, setRegions] = useState<Record<number, Region[]>>({})
   /** The rectangle being dragged out, drawn until the pointer is released. */
   const [pending, setPending] = useState<Region | null>(null)
@@ -271,19 +317,25 @@ const FloorplanViewer = ({ url, name }: Props) => {
           <ChevronRight className="size-4" />
         </Button>
         <Separator orientation="vertical" className="mx-1 h-6" />
-        <Button
-          size="sm"
-          variant={marking ? "secondary" : "ghost"}
-          aria-pressed={marking}
-          disabled={!doc}
-          onClick={() => {
-            cancelDrag()
-            setMarking((on) => !on)
-          }}
-        >
-          <SquareDashed className="size-4" />
-          Ignore areas
-        </Button>
+        {KIND_ORDER.map((kind) => {
+          const { icon: Icon, label } = KINDS[kind]
+          return (
+            <Button
+              key={kind}
+              size="sm"
+              variant={mode === kind ? "secondary" : "ghost"}
+              aria-pressed={mode === kind}
+              disabled={!doc}
+              onClick={() => {
+                cancelDrag()
+                setMode((current) => (current === kind ? null : kind))
+              }}
+            >
+              <Icon className="size-4" />
+              {label}
+            </Button>
+          )
+        })}
         {pageRegions.length > 0 && (
           <Button
             size="sm"
@@ -296,9 +348,9 @@ const FloorplanViewer = ({ url, name }: Props) => {
             Clear {pageRegions.length}
           </Button>
         )}
-        {marking && (
+        {mode && (
           <span className="hidden text-sm text-muted-foreground md:inline">
-            Drag over content to ignore
+            {KINDS[mode].hint}
           </span>
         )}
       </div>
@@ -314,7 +366,7 @@ const FloorplanViewer = ({ url, name }: Props) => {
               aria-label={`${name}, page ${page} of ${pages}`}
             />
             {/* Drag surface, above the page but below the marks. */}
-            {marking && (
+            {mode && (
               <div
                 className="absolute inset-0 cursor-crosshair touch-none"
                 onPointerDown={(event) => {
@@ -326,7 +378,7 @@ const FloorplanViewer = ({ url, name }: Props) => {
                     event.clientY
                   )
                   originRef.current = start
-                  setPending({ id: "pending", ...start, w: 0, h: 0 })
+                  setPending({ id: "pending", kind: mode, ...start, w: 0, h: 0 })
                 }}
                 onPointerMove={(event) => {
                   const origin = originRef.current
@@ -338,6 +390,7 @@ const FloorplanViewer = ({ url, name }: Props) => {
                   )
                   setPending({
                     id: "pending",
+                    kind: mode,
                     x: Math.min(origin.x, to.x),
                     y: Math.min(origin.y, to.y),
                     w: Math.abs(to.x - origin.x),
@@ -368,7 +421,7 @@ const FloorplanViewer = ({ url, name }: Props) => {
               {pageRegions.map((region) => (
                 <div
                   key={region.id}
-                  className="absolute border-2 border-red-500 bg-red-500/10"
+                  className={`absolute border-2 ${KINDS[region.kind].box}`}
                   style={{
                     left: `${region.x * 100}%`,
                     top: `${region.y * 100}%`,
@@ -376,12 +429,12 @@ const FloorplanViewer = ({ url, name }: Props) => {
                     height: `${region.h * 100}%`,
                   }}
                 >
-                  {marking && (
+                  {mode && (
                     <button
                       type="button"
-                      aria-label="Remove ignored area"
+                      aria-label={KINDS[region.kind].remove}
                       onClick={() => removeRegion(region.id)}
-                      className="pointer-events-auto absolute -top-2.5 -right-2.5 grid size-5 place-items-center rounded-full bg-red-500 text-white shadow-sm hover:bg-red-600"
+                      className={`pointer-events-auto absolute -top-2.5 -right-2.5 grid size-5 place-items-center rounded-full text-white shadow-sm ${KINDS[region.kind].handle}`}
                     >
                       <X className="size-3" />
                     </button>
@@ -390,7 +443,7 @@ const FloorplanViewer = ({ url, name }: Props) => {
               ))}
               {pending && (
                 <div
-                  className="absolute border-2 border-dashed border-red-500 bg-red-500/10"
+                  className={`absolute border-2 border-dashed ${KINDS[pending.kind].box}`}
                   style={{
                     left: `${pending.x * 100}%`,
                     top: `${pending.y * 100}%`,
