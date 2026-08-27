@@ -3,6 +3,13 @@
 import { revalidatePath } from "next/cache"
 
 import {
+  ANNOTATIONS_TABLE,
+  isRegion,
+  reasonForTable,
+  toRow,
+  type Region,
+} from "@/lib/annotations"
+import {
   BUCKET,
   MAX_UPLOAD_BYTES,
   emptyUploadState,
@@ -109,4 +116,54 @@ export async function uploadFloorplans(
   if (uploaded.length > 0) revalidatePath("/floorplans")
 
   return { uploaded, failed, error: null }
+}
+
+/** Outcome of a write, with `error` set when the change did not stick. */
+export type SaveState = { error: string | null }
+
+const ok: SaveState = { error: null }
+
+/** Adds one drawn rectangle to a floorplan. */
+export async function saveRegion(
+  objectPath: string,
+  page: number,
+  region: Region
+): Promise<SaveState> {
+  if (!objectPath) return { error: "Missing floorplan" }
+  if (!Number.isInteger(page) || page < 1) return { error: "Invalid page" }
+  if (!isRegion(region)) return { error: "Invalid region" }
+
+  try {
+    const { error } = await getSupabase()
+      .from(ANNOTATIONS_TABLE)
+      // Re-saving the same id is a no-op, so a retried write cannot duplicate.
+      .upsert(toRow(objectPath, page, region))
+
+    return error ? { error: reasonForTable(error.message, error.code) } : ok
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : "Could not save" }
+  }
+}
+
+/** Removes drawn rectangles by id, scoped to the floorplan they belong to. */
+export async function deleteRegions(
+  objectPath: string,
+  ids: string[]
+): Promise<SaveState> {
+  if (!objectPath) return { error: "Missing floorplan" }
+  if (ids.length === 0) return ok
+
+  try {
+    const { error } = await getSupabase()
+      .from(ANNOTATIONS_TABLE)
+      .delete()
+      .eq("object_path", objectPath)
+      .in("id", ids)
+
+    return error ? { error: reasonForTable(error.message, error.code) } : ok
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : "Could not remove",
+    }
+  }
 }

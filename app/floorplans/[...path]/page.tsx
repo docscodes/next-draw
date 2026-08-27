@@ -2,6 +2,7 @@ import { AlertTriangle, ArrowLeft, Download, ExternalLink } from "lucide-react"
 import Link from "next/link"
 import { notFound } from "next/navigation"
 
+import { getAnnotations } from "@/lib/annotations"
 import { getFloorplan } from "@/lib/floorplans"
 import { formatDate, formatSize } from "@/lib/format"
 import { Button } from "@/components/ui/button"
@@ -23,6 +24,9 @@ export default async function Page({ params }: Props) {
   const { floorplan, error } = await getFloorplan(objectPath)
 
   if (error === "notFound") notFound()
+
+  // Marks are loaded here so the page opens with them already drawn.
+  const { regions, error: regionsError } = await getAnnotations(objectPath)
 
   const updatedAt = floorplan && formatDate(floorplan.updatedAt)
 
@@ -81,7 +85,15 @@ export default async function Page({ params }: Props) {
           </div>
         </div>
       ) : (
-        <FloorplanViewer url={floorplan.url} name={floorplan.name} />
+        <FloorplanViewer
+          // Remounting on a new plan swaps in that plan's saved marks.
+          key={floorplan.path}
+          url={floorplan.url}
+          name={floorplan.name}
+          path={floorplan.path}
+          regions={regions}
+          regionsError={regionsError}
+        />
       )}
     </div>
   )

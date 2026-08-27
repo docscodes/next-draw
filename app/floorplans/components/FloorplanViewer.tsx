@@ -21,29 +21,14 @@ import type {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
+import type { PageRegions, Region, RegionKind } from "@/lib/annotations"
+import { deleteRegions, saveRegion } from "../actions"
 
 /** Widest the page is drawn, so single-page plans stay readable on 4K screens. */
 const MAX_PAGE_WIDTH = 1400
 
 /** Drags shorter than this are treated as a stray click, not a rectangle. */
 const MIN_REGION_PX = 8
-
-/** What a drawn rectangle is for. */
-type RegionKind = "ignore" | "capture"
-
-/**
- * A rectangle over part of the page: either content the reader should skip —
- * title blocks, legends, revision tables — or text that should be pulled out
- * of the plan. Stored as fractions of the page so it survives resizing.
- */
-type Region = {
-  id: string
-  kind: RegionKind
-  x: number
-  y: number
-  w: number
-  h: number
-}
 
 /** Wording and colours per kind. Classes are spelled out so Tailwind keeps them. */
 const KINDS: Record<
@@ -77,11 +62,40 @@ const KINDS: Record<
 
 const KIND_ORDER = Object.keys(KINDS) as RegionKind[]
 
-type Props = { url: string; name: string }
+/**
+ * How a mark's remove handle behaves. While marking it stays out, and the mark
+ * itself must not swallow drags. While reading the mark takes the pointer so
+ * hovering it — or tabbing to the handle — brings the handle up.
+ */
+const HANDLES = {
+  marking: { mark: "", handle: "pointer-events-auto" },
+  reading: {
+    mark: "pointer-events-auto",
+    handle:
+      "pointer-events-none opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100",
+  },
+}
+
+type Props = {
+  url: string
+  name: string
+  /** Object path in the bucket, used as the key marks are saved under. */
+  path: string
+  /** Marks already saved for this plan, grouped by page. */
+  regions: PageRegions
+  /** Set when the saved marks could not be read; marking still works. */
+  regionsError: string | null
+}
 
 const clamp01 = (value: number) => Math.min(Math.max(value, 0), 1)
 
-const FloorplanViewer = ({ url, name }: Props) => {
+const FloorplanViewer = ({
+  url,
+  name,
+  path,
+  regions: saved,
+  regionsError,
+}: Props) => {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   /** Where the current drag began, in page fractions. */
@@ -95,12 +109,17 @@ const FloorplanViewer = ({ url, name }: Props) => {
   const [error, setError] = useState<string | null>(null)
   /** Which kind of rectangle the pointer draws, or null when just reading. */
   const [mode, setMode] = useState<RegionKind | null>(null)
-  const [regions, setRegions] = useState<Record<number, Region[]>>({})
+  const [regions, setRegions] = useState<PageRegions>(saved)
   /** The rectangle being dragged out, drawn until the pointer is released. */
   const [pending, setPending] = useState<Region | null>(null)
+  /** Why the last write to Supabase did not stick, if it failed. */
+  const [saveError, setSaveError] = useState<string | null>(regionsError)
+  /** How many writes are still in flight. */
+  const [writes, setWrites] = useState(0)
 
   const pages = doc?.numPages ?? 0
   const pageRegions = regions[page] ?? []
+  const handles = HANDLES[mode ? "marking" : "reading"]
 
   const goTo = useCallback(
     (next: number) => {
@@ -140,7 +159,6 @@ const FloorplanViewer = ({ url, name }: Props) => {
       setDoc(opened)
       setPage(1)
       setDraft("1")
-      setRegions({})
     }
 
     const task = open().catch((cause: unknown) => {
@@ -251,11 +269,69 @@ const FloorplanViewer = ({ url, name }: Props) => {
     }
   }
 
-  const removeRegion = (id: string) =>
+  /**
+   * Applies a change to the page straight away and sends it to Supabase. A
+   * rejected write is undone, so what is drawn always matches what is stored.
+   */
+  const write = async (
+    send: () => Promise<{ error: string | null }>,
+    undo: () => void
+  ) => {
+    setWrites((count) => count + 1)
+    try {
+      const { error } = await send()
+      if (error) {
+        setSaveError(error)
+        undo()
+      } else {
+        setSaveError(null)
+      }
+    } catch (cause) {
+      setSaveError(cause instanceof Error ? cause.message : "Could not save")
+      undo()
+    } finally {
+      setWrites((count) => count - 1)
+    }
+  }
+
+  const addRegion = (on: number, region: Region) =>
     setRegions((current) => ({
       ...current,
-      [page]: (current[page] ?? []).filter((region) => region.id !== id),
+      [on]: [...(current[on] ?? []), region],
     }))
+
+  const dropRegions = (on: number, ids: Set<string>) =>
+    setRegions((current) => ({
+      ...current,
+      [on]: (current[on] ?? []).filter((region) => !ids.has(region.id)),
+    }))
+
+  const createRegion = (region: Region) => {
+    const on = page
+    addRegion(on, region)
+    void write(
+      () => saveRegion(path, on, region),
+      () => dropRegions(on, new Set([region.id]))
+    )
+  }
+
+  const removeRegions = (removed: Region[]) => {
+    const on = page
+    dropRegions(on, new Set(removed.map((region) => region.id)))
+    void write(
+      () =>
+        deleteRegions(
+          path,
+          removed.map((region) => region.id)
+        ),
+      // Order within a page is not meaningful, so restoring by append is fine.
+      () =>
+        setRegions((current) => ({
+          ...current,
+          [on]: [...(current[on] ?? []), ...removed],
+        }))
+    )
+  }
 
   if (error) {
     return (
@@ -340,13 +416,17 @@ const FloorplanViewer = ({ url, name }: Props) => {
           <Button
             size="sm"
             variant="ghost"
-            onClick={() =>
-              setRegions((current) => ({ ...current, [page]: [] }))
-            }
+            onClick={() => removeRegions(pageRegions)}
           >
             <Eraser className="size-4" />
             Clear {pageRegions.length}
           </Button>
+        )}
+        {writes > 0 && (
+          <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin" />
+            Saving
+          </span>
         )}
         {mode && (
           <span className="hidden text-sm text-muted-foreground md:inline">
@@ -354,6 +434,15 @@ const FloorplanViewer = ({ url, name }: Props) => {
           </span>
         )}
       </div>
+      {saveError && (
+        <div className="flex items-start gap-2 border-b border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+          <p>
+            <span className="font-medium">Marks are not being saved.</span>{" "}
+            {saveError}
+          </p>
+        </div>
+      )}
       <div
         ref={scrollRef}
         className="flex flex-1 justify-center overflow-auto p-4"
@@ -378,7 +467,13 @@ const FloorplanViewer = ({ url, name }: Props) => {
                     event.clientY
                   )
                   originRef.current = start
-                  setPending({ id: "pending", kind: mode, ...start, w: 0, h: 0 })
+                  setPending({
+                    id: "pending",
+                    kind: mode,
+                    ...start,
+                    w: 0,
+                    h: 0,
+                  })
                 }}
                 onPointerMove={(event) => {
                   const origin = originRef.current
@@ -407,11 +502,7 @@ const FloorplanViewer = ({ url, name }: Props) => {
                     drawn.h * box.height < MIN_REGION_PX
                   )
                     return
-                  const region = { ...drawn, id: crypto.randomUUID() }
-                  setRegions((current) => ({
-                    ...current,
-                    [page]: [...(current[page] ?? []), region],
-                  }))
+                  createRegion({ ...drawn, id: crypto.randomUUID() })
                 }}
                 onPointerCancel={cancelDrag}
               />
@@ -421,7 +512,7 @@ const FloorplanViewer = ({ url, name }: Props) => {
               {pageRegions.map((region) => (
                 <div
                   key={region.id}
-                  className={`absolute border-2 ${KINDS[region.kind].box}`}
+                  className={`group absolute border-2 ${handles.mark} ${KINDS[region.kind].box}`}
                   style={{
                     left: `${region.x * 100}%`,
                     top: `${region.y * 100}%`,
@@ -429,16 +520,14 @@ const FloorplanViewer = ({ url, name }: Props) => {
                     height: `${region.h * 100}%`,
                   }}
                 >
-                  {mode && (
-                    <button
-                      type="button"
-                      aria-label={KINDS[region.kind].remove}
-                      onClick={() => removeRegion(region.id)}
-                      className={`pointer-events-auto absolute -top-2.5 -right-2.5 grid size-5 place-items-center rounded-full text-white shadow-sm ${KINDS[region.kind].handle}`}
-                    >
-                      <X className="size-3" />
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    aria-label={KINDS[region.kind].remove}
+                    onClick={() => removeRegions([region])}
+                    className={`absolute -top-2.5 -right-2.5 grid size-5 place-items-center rounded-full text-white shadow-sm ${handles.handle} ${KINDS[region.kind].handle}`}
+                  >
+                    <X className="size-3" />
+                  </button>
                 </div>
               ))}
               {pending && (
