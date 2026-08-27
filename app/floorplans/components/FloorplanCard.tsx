@@ -1,6 +1,8 @@
 import { Download, FileText } from "lucide-react"
+import Link from "next/link"
 
-import type { Floorplan } from "@/lib/floorplans"
+import { floorplanHref, type Floorplan } from "@/lib/floorplans"
+import { formatDate, formatSize } from "@/lib/format"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -10,33 +12,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-
-const dateFormatter = new Intl.DateTimeFormat("en-GB", {
-  dateStyle: "medium",
-  timeZone: "UTC",
-})
-
-function formatSize(bytes: number | null) {
-  if (bytes === null) return "Unknown size"
-  if (bytes < 1024) return `${bytes} B`
-
-  const units = ["KB", "MB", "GB"]
-  let size = bytes / 1024
-  let unit = 0
-
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024
-    unit++
-  }
-
-  return `${size.toFixed(size < 10 ? 1 : 0)} ${units[unit]}`
-}
-
-function formatDate(value: string | null) {
-  if (!value) return null
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? null : dateFormatter.format(date)
-}
 
 const FloorplanCard = ({ floorplan }: { floorplan: Floorplan }) => {
   const updatedAt = formatDate(floorplan.updatedAt)
@@ -76,22 +51,17 @@ const FloorplanCard = ({ floorplan }: { floorplan: Floorplan }) => {
       </CardContent>
 
       <CardFooter className="mt-auto gap-2">
-        {floorplan.url ? (
-          <>
-            <Button asChild size="sm" className="flex-1">
-              <a href={floorplan.url} target="_blank" rel="noopener noreferrer">
-                View
-              </a>
-            </Button>
-            <Button asChild size="sm" variant="outline">
-              <a href={`${floorplan.url}&download=`}>
-                <Download className="size-4" />
-                <span className="sr-only">Download {floorplan.name}</span>
-              </a>
-            </Button>
-          </>
-        ) : (
-          <p className="text-xs text-muted-foreground">Link unavailable</p>
+        <Button asChild size="sm" className="flex-1">
+          {/* The viewer page signs its own URL, so this link never expires. */}
+          <Link href={floorplanHref(floorplan.path)}>View</Link>
+        </Button>
+        {floorplan.url && (
+          <Button asChild size="sm" variant="outline">
+            <a href={`${floorplan.url}&download=`}>
+              <Download className="size-4" />
+              <span className="sr-only">Download {floorplan.name}</span>
+            </a>
+          </Button>
         )}
       </CardFooter>
     </Card>

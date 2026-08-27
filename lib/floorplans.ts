@@ -102,6 +102,55 @@ async function listFolder(
   return [...files, ...nested.flat()]
 }
 
+/** Builds the app URL for a floorplan detail page from its object path. */
+export function floorplanHref(path: string) {
+  return `/floorplans/${path.split("/").map(encodeURIComponent).join("/")}`
+}
+
+export type FloorplanResult =
+  { floorplan: Floorplan; error: null } | { floorplan: null; error: string }
+
+/**
+ * Looks up a single object by its full path. Returns `notFound` as the error
+ * when the bucket has no such PDF, so the caller can render a 404.
+ */
+export async function getFloorplan(path: string): Promise<FloorplanResult> {
+  const slash = path.lastIndexOf("/")
+  const folder = slash === -1 ? "" : path.slice(0, slash)
+  const name = path.slice(slash + 1)
+
+  if (!name) return { floorplan: null, error: "notFound" }
+
+  const supabase = getSupabase()
+
+  const { data, error } = await supabase.storage.from(BUCKET).list(folder, {
+    limit: PAGE_SIZE,
+    // `search` is a partial match, so the exact name is picked out below.
+    search: name,
+  })
+
+  if (error) return { floorplan: null, error: error.message }
+
+  const file = data.find((entry) => entry.name === name && !isFolder(entry))
+  if (!file || !isPdf(file)) return { floorplan: null, error: "notFound" }
+
+  const { data: signed } = await supabase.storage
+    .from(BUCKET)
+    .createSignedUrl(path, SIGNED_URL_TTL)
+
+  return {
+    floorplan: {
+      path,
+      name,
+      folder,
+      size: file.metadata?.size ?? null,
+      updatedAt: file.updated_at ?? file.created_at,
+      url: signed?.signedUrl ?? null,
+    },
+    error: null,
+  }
+}
+
 /** Lists every PDF in the floorplans bucket, each with a signed URL. */
 export async function listFloorplans(): Promise<FloorplansResult> {
   let files: { file: StorageFile; path: string }[]
