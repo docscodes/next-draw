@@ -1,4 +1,4 @@
-import { ChevronUp, Home, User2 } from "lucide-react"
+import { ChevronUp, Home, Map, User2 } from "lucide-react"
 import Image from "next/image"
 import Link from "next/link"
 import {
@@ -28,11 +28,16 @@ const items = [
     url: "/",
     icon: Home,
   },
+  {
+    title: "Floorplans",
+    url: "/floorplans",
+    icon: Map,
+  },
 ]
 
 const AppSidebar = () => {
   return (
-    <Sidebar collapsible="icon">
+    <Sidebar collapsible="icon" className="overflow-hidden">
       <SidebarHeader className="py-4">
         <SidebarMenu>
           <SidebarMenuItem>
