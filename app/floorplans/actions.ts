@@ -1,128 +1,112 @@
+"use server"
+
+import { revalidatePath } from "next/cache"
+
+import {
+  BUCKET,
+  MAX_UPLOAD_BYTES,
+  emptyUploadState,
+  type UploadState,
+} from "@/lib/floorplans"
 import { getSupabase } from "@/lib/supabase"
-import type { SupabaseClient } from "@supabase/supabase-js"
-
-/** `FileObject` isn't re-exported by supabase-js, so derive it from `list`. */
-type StorageFile = NonNullable<
-  Awaited<
-    ReturnType<ReturnType<SupabaseClient["storage"]["from"]>["list"]>
-  >["data"]
->[number]
-
-const BUCKET = process.env.SUPABASE_FLOORPLANS_BUCKET ?? "floorplans"
-
-/** How long the links handed to the browser stay valid, in seconds. */
-const SIGNED_URL_TTL = 60 * 60
-
-/** Supabase caps `list` at 100 rows per call, so folders are paged through. */
-const PAGE_SIZE = 100
-
-/** Guards against pathological bucket layouts while still walking subfolders. */
-const MAX_DEPTH = 5
-
-export type Floorplan = {
-  /** Full object path inside the bucket, e.g. `level-1/east-wing.pdf`. */
-  path: string
-  /** File name without its parent folders. */
-  name: string
-  /** Parent folder path, empty for files at the bucket root. */
-  folder: string
-  size: number | null
-  updatedAt: string | null
-  /** Time-limited link, null when signing the object failed. */
-  url: string | null
-}
-
-export type FloorplansResult =
-  { floorplans: Floorplan[]; error: null } | { floorplans: null; error: string }
-
-const isPdf = (file: StorageFile) =>
-  file.metadata?.mimetype === "application/pdf" ||
-  file.name.toLowerCase().endsWith(".pdf")
 
 /**
- * Folder rows come back without an id, as does the placeholder object Supabase
- * writes when an empty folder is created.
+ * Strips any directory part the browser may have sent and reduces the rest to
+ * characters Supabase accepts in an object key.
  */
-const isFolder = (file: StorageFile) => file.id === null
+function toObjectName(fileName: string) {
+  const base = fileName.split(/[/\\]/).pop() ?? ""
+  const cleaned = base
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^[-.]+|-+$/g, "")
 
-/** Lists one prefix and recurses into its subfolders, keeping full paths. */
-async function listFolder(
-  prefix: string,
-  depth: number
-): Promise<{ file: StorageFile; path: string }[]> {
-  const supabase = getSupabase()
-  const entries: StorageFile[] = []
+  if (!cleaned) return `floorplan-${Date.now()}.pdf`
 
-  for (let offset = 0; ; offset += PAGE_SIZE) {
-    const { data, error } = await supabase.storage.from(BUCKET).list(prefix, {
-      limit: PAGE_SIZE,
-      offset,
-      sortBy: { column: "name", order: "asc" },
-    })
-
-    if (error) throw new Error(error.message)
-    entries.push(...data)
-    if (data.length < PAGE_SIZE) break
-  }
-
-  const join = (name: string) => (prefix ? `${prefix}/${name}` : name)
-
-  const files = entries
-    .filter((entry) => !isFolder(entry))
-    .map((file) => ({ file, path: join(file.name) }))
-
-  if (depth >= MAX_DEPTH) return files
-
-  const nested = await Promise.all(
-    entries
-      .filter(isFolder)
-      .map((folder) => listFolder(join(folder.name), depth + 1))
-  )
-
-  return [...files, ...nested.flat()]
+  return cleaned.toLowerCase().endsWith(".pdf") ? cleaned : `${cleaned}.pdf`
 }
 
-/** Lists every PDF in the floorplans bucket, each with a signed URL. */
-export async function listFloorplans(): Promise<FloorplansResult> {
-  let files: { file: StorageFile; path: string }[]
+function isPdf(file: File) {
+  return (
+    file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")
+  )
+}
 
+/** Turns a Supabase storage error into something worth showing a user. */
+function reasonFor(message: string) {
+  if (/already exists|duplicate/i.test(message)) {
+    return "A floorplan with that name already exists"
+  }
+  return message
+}
+
+/**
+ * Imports one or more PDFs into the floorplans bucket. Existing files are never
+ * overwritten — a name clash is reported back so the user can rename first.
+ */
+export async function uploadFloorplans(
+  _prevState: UploadState,
+  formData: FormData
+): Promise<UploadState> {
+  const files = formData
+    .getAll("files")
+    .filter((entry): entry is File => entry instanceof File && entry.size > 0)
+
+  if (files.length === 0) {
+    return { ...emptyUploadState, error: "Select at least one PDF to import." }
+  }
+
+  const uploaded: string[] = []
+  const failed: UploadState["failed"] = []
+
+  let supabase: ReturnType<typeof getSupabase>
   try {
-    files = (await listFolder("", 0)).filter((entry) => isPdf(entry.file))
+    supabase = getSupabase()
   } catch (error) {
     return {
-      floorplans: null,
+      ...emptyUploadState,
       error: error instanceof Error ? error.message : "Unknown error",
     }
   }
 
-  if (files.length === 0) return { floorplans: [], error: null }
+  const results = await Promise.all(
+    files.map(async (file) => {
+      if (!isPdf(file)) {
+        return { name: file.name, reason: "Not a PDF" }
+      }
 
-  const supabase = getSupabase()
-  const { data: signed, error } = await supabase.storage
-    .from(BUCKET)
-    .createSignedUrls(
-      files.map((entry) => entry.path),
-      SIGNED_URL_TTL
-    )
+      if (file.size > MAX_UPLOAD_BYTES) {
+        const limit = Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)
+        return { name: file.name, reason: `Larger than ${limit} MB` }
+      }
 
-  if (error) return { floorplans: null, error: error.message }
+      try {
+        const { error } = await supabase.storage
+          .from(BUCKET)
+          .upload(toObjectName(file.name), file, {
+            contentType: "application/pdf",
+            upsert: false,
+          })
 
-  const urls = new Map(signed.map((entry) => [entry.path, entry.signedUrl]))
+        return error
+          ? { name: file.name, reason: reasonFor(error.message) }
+          : null
+      } catch (error) {
+        // Network-level failures reject instead of returning an error.
+        return {
+          name: file.name,
+          reason: error instanceof Error ? error.message : "Upload failed",
+        }
+      }
+    })
+  )
 
-  const floorplans = files.map(({ file, path }) => {
-    const slash = path.lastIndexOf("/")
-
-    return {
-      path,
-      name: path.slice(slash + 1),
-      folder: slash === -1 ? "" : path.slice(0, slash),
-      size: file.metadata?.size ?? null,
-      updatedAt: file.updated_at ?? file.created_at,
-      url: urls.get(path) ?? null,
-    }
+  files.forEach((file, index) => {
+    const failure = results[index]
+    if (failure) failed.push(failure)
+    else uploaded.push(file.name)
   })
 
-  floorplans.sort((a, b) => a.path.localeCompare(b.path))
+  if (uploaded.length > 0) revalidatePath("/floorplans")
 
-  return { floorplans, error: null }
+  return { uploaded, failed, error: null }
 }

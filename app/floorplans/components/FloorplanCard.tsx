@@ -1,6 +1,6 @@
 import { Download, FileText } from "lucide-react"
 
-import type { Floorplan } from "@/app/floorplans/actions"
+import type { Floorplan } from "@/lib/floorplans"
 import { Button } from "@/components/ui/button"
 import {
   Card,

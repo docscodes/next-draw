@@ -1,7 +1,8 @@
 import { AlertTriangle, FolderOpen } from "lucide-react"
 
-import FloorplanCard from "@/app/floorplans/components/FloorplanCard"
-import { listFloorplans } from "./actions"
+import { listFloorplans } from "@/lib/floorplans"
+import FloorplanCard from "./components/FloorplanCard"
+import ImportFloorplans from "./components/ImportFloorplans"
 
 export const metadata = {
   title: "Floorplans",
@@ -17,15 +18,18 @@ export default async function Page() {
 
   return (
     <div className="py-6">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold tracking-tight">Floorplans</h1>
-        <p className="text-sm text-muted-foreground">
-          {result.error
-            ? "PDF floorplans from Supabase Storage."
-            : `${floorplans.length} PDF ${
-                floorplans.length === 1 ? "file" : "files"
-              } in Supabase Storage.`}
-        </p>
+      <header className="mb-6 flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Floorplans</h1>
+          <p className="text-sm text-muted-foreground">
+            {result.error
+              ? "PDF floorplans from Supabase Storage."
+              : `${floorplans.length} PDF ${
+                  floorplans.length === 1 ? "file" : "files"
+                } in Supabase Storage.`}
+          </p>
+        </div>
+        <ImportFloorplans />
       </header>
 
       {result.error ? (
@@ -41,7 +45,7 @@ export default async function Page() {
           <FolderOpen className="size-8" />
           <p className="font-medium">No floorplans yet</p>
           <p className="text-sm">
-            Upload PDF files to the storage bucket and they will show up here.
+            Import PDF files and they will show up here.
           </p>
         </div>
       ) : (
