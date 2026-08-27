@@ -11,8 +11,9 @@ type StorageFile = NonNullable<
 export const BUCKET = process.env.SUPABASE_FLOORPLANS_BUCKET ?? "floorplans"
 
 /**
- * Per-file upload cap. Keep this in sync with `serverActions.bodySizeLimit`
- * in next.config.ts, which bounds the whole request.
+ * Per-file upload cap. The bytes never pass through a server action — they go
+ * straight from the browser to Supabase — so this is not bounded by the
+ * host's request body limit.
  */
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
@@ -41,7 +42,7 @@ export type Floorplan = {
 export type FloorplansResult =
   { floorplans: Floorplan[]; error: null } | { floorplans: null; error: string }
 
-/** Result of an import, rendered back into the page by `useActionState`. */
+/** Result of an import, rendered back into the page. */
 export type UploadState = {
   uploaded: string[]
   failed: { name: string; reason: string }[]
@@ -54,6 +55,20 @@ export const emptyUploadState: UploadState = {
   failed: [],
   error: null,
 }
+
+/**
+ * Permission to upload one file, or the reason that file was turned away.
+ * `url` is pre-authorised, so the browser PUTs the PDF to it directly.
+ */
+export type UploadSlot =
+  { url: string; reason?: never } | { url?: never; reason: string }
+
+/**
+ * Slots for a whole selection, index-aligned with the files the browser
+ * offered. `error` is set when nothing could be prepared at all.
+ */
+export type UploadSlots =
+  { slots: UploadSlot[]; error: null } | { slots: null; error: string }
 
 const isPdf = (file: StorageFile) =>
   file.metadata?.mimetype === "application/pdf" ||

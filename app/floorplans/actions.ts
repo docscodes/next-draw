@@ -13,8 +13,8 @@ import {
 import {
   BUCKET,
   MAX_UPLOAD_BYTES,
-  emptyUploadState,
-  type UploadState,
+  type UploadSlot,
+  type UploadSlots,
 } from "@/lib/floorplans"
 import { getSupabase } from "@/lib/supabase"
 
@@ -33,7 +33,10 @@ function toObjectName(fileName: string) {
   return cleaned.toLowerCase().endsWith(".pdf") ? cleaned : `${cleaned}.pdf`
 }
 
-function isPdf(file: File) {
+/** What the browser tells us about one file it wants to import. */
+type Candidate = { name: string; size: number; type: string }
+
+function isPdf(file: Candidate) {
   return (
     file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")
   )
@@ -47,76 +50,78 @@ function reasonFor(message: string) {
   return message
 }
 
-/**
- * Imports one or more PDFs into the floorplans bucket. Existing files are never
- * overwritten — a name clash is reported back so the user can rename first.
- */
-export async function uploadFloorplans(
-  _prevState: UploadState,
-  formData: FormData
-): Promise<UploadState> {
-  const files = formData
-    .getAll("files")
-    .filter((entry): entry is File => entry instanceof File && entry.size > 0)
+/** Guards against a client asking for an unbounded number of signatures. */
+const MAX_FILES_PER_IMPORT = 50
 
+/**
+ * Hands the browser one pre-authorised URL per PDF, so the bytes go straight
+ * to the floorplans bucket. Sending the files through this action instead
+ * would cap an import at the host's request body limit — 4.5 MB on Vercel, no
+ * matter what `serverActions.bodySizeLimit` says.
+ *
+ * Returns one slot per file, in the order they were offered. Existing files
+ * are never overwritten: the signed URL is minted with `upsert: false`, so a
+ * name clash is rejected when the browser uploads.
+ */
+export async function createUploadSlots(
+  files: Candidate[]
+): Promise<UploadSlots> {
   if (files.length === 0) {
-    return { ...emptyUploadState, error: "Select at least one PDF to import." }
+    return { slots: null, error: "Select at least one PDF to import." }
   }
 
-  const uploaded: string[] = []
-  const failed: UploadState["failed"] = []
+  if (files.length > MAX_FILES_PER_IMPORT) {
+    return {
+      slots: null,
+      error: `Import at most ${MAX_FILES_PER_IMPORT} files at a time.`,
+    }
+  }
 
   let supabase: ReturnType<typeof getSupabase>
   try {
     supabase = getSupabase()
   } catch (error) {
     return {
-      ...emptyUploadState,
+      slots: null,
       error: error instanceof Error ? error.message : "Unknown error",
     }
   }
 
-  const results = await Promise.all(
-    files.map(async (file) => {
-      if (!isPdf(file)) {
-        return { name: file.name, reason: "Not a PDF" }
-      }
+  const slots = await Promise.all(
+    files.map(async (file): Promise<UploadSlot> => {
+      if (!isPdf(file)) return { reason: "Not a PDF" }
 
       if (file.size > MAX_UPLOAD_BYTES) {
         const limit = Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)
-        return { name: file.name, reason: `Larger than ${limit} MB` }
+        return { reason: `Larger than ${limit} MB` }
       }
 
       try {
-        const { error } = await supabase.storage
+        const { data, error } = await supabase.storage
           .from(BUCKET)
-          .upload(toObjectName(file.name), file, {
-            contentType: "application/pdf",
-            upsert: false,
-          })
+          .createSignedUploadUrl(toObjectName(file.name), { upsert: false })
 
         return error
-          ? { name: file.name, reason: reasonFor(error.message) }
-          : null
+          ? { reason: reasonFor(error.message) }
+          : { url: data.signedUrl }
       } catch (error) {
         // Network-level failures reject instead of returning an error.
         return {
-          name: file.name,
           reason: error instanceof Error ? error.message : "Upload failed",
         }
       }
     })
   )
 
-  files.forEach((file, index) => {
-    const failure = results[index]
-    if (failure) failed.push(failure)
-    else uploaded.push(file.name)
-  })
+  return { slots, error: null }
+}
 
-  if (uploaded.length > 0) revalidatePath("/floorplans")
-
-  return { uploaded, failed, error: null }
+/**
+ * Refreshes the list once the browser has finished uploading. Separate from
+ * `createUploadSlots` because the objects do not exist until then.
+ */
+export async function revalidateFloorplans() {
+  revalidatePath("/floorplans")
 }
 
 /** Outcome of a write, with `error` set when the change did not stick. */

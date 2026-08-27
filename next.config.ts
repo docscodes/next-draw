@@ -1,13 +1,7 @@
 import type { NextConfig } from "next"
 
-const nextConfig: NextConfig = {
-  experimental: {
-    serverActions: {
-      // Floorplan PDFs routinely exceed the 1MB default. Keep this in sync
-      // with MAX_UPLOAD_BYTES in lib/floorplans.ts.
-      bodySizeLimit: "25mb",
-    },
-  },
-}
+// Floorplan PDFs go straight from the browser to Supabase Storage, so no
+// server action ever carries them and the default body limit is plenty.
+const nextConfig: NextConfig = {}
 
 export default nextConfig
