@@ -22,6 +22,10 @@ export type Region = {
   y: number
   w: number
   h: number
+  /** Text OCR read out of a capture rectangle, null until it has been read. */
+  text?: string | null
+  /** Tesseract's mean confidence for that text, on its own 0-100 scale. */
+  confidence?: number | null
 }
 
 /** A plan's regions, grouped by 1-based page number. */
@@ -37,7 +41,15 @@ type AnnotationRow = {
   y: number
   w: number
   h: number
+  text: string | null
+  confidence: number | null
 }
+
+/**
+ * Longest reading kept from a single rectangle. A drag over a whole sheet can
+ * pull out pages of text; past this it is noise, not a label.
+ */
+export const MAX_TEXT_LENGTH = 20_000
 
 const KINDS: RegionKind[] = ["ignore", "capture"]
 
@@ -79,17 +91,29 @@ export function reasonForTable(message: string, code?: string) {
   ) {
     return `Table "${ANNOTATIONS_TABLE}" is missing. Run supabase/migrations/0001_floorplan_annotations.sql in your Supabase project.`
   }
+  // 42703 is Postgres; PGRST204 is PostgREST not knowing the column.
+  if (
+    code === "42703" ||
+    code === "PGRST204" ||
+    /column .* does not exist|could not find the .* column/i.test(message)
+  ) {
+    return `Table "${ANNOTATIONS_TABLE}" is missing a column. Run supabase/migrations/0002_floorplan_annotation_text.sql in your Supabase project.`
+  }
   if (code === "42501" || /row-level security/i.test(message)) {
     return `Not allowed to write "${ANNOTATIONS_TABLE}". Use a service role key, or add the policy at the end of the migration.`
   }
   return message
 }
 
+/**
+ * A newly drawn rectangle, as it is stored. The OCR columns are left out: this
+ * row is upserted, and naming them would blank a reading that already landed.
+ */
 export const toRow = (
   objectPath: string,
   page: number,
   region: Region
-): AnnotationRow => ({
+): Omit<AnnotationRow, "text" | "confidence"> => ({
   id: region.id,
   object_path: objectPath,
   page,
@@ -114,7 +138,7 @@ export async function getAnnotations(
   try {
     const { data, error } = await getSupabase()
       .from(ANNOTATIONS_TABLE)
-      .select("id, object_path, page, kind, x, y, w, h")
+      .select("id, object_path, page, kind, x, y, w, h, text, confidence")
       .eq("object_path", objectPath)
       .order("created_at", { ascending: true })
 
@@ -140,6 +164,8 @@ export async function getAnnotations(
       y: row.y,
       w: row.w,
       h: row.h,
+      text: row.text,
+      confidence: row.confidence,
     }
     if (!isRegion(region)) continue
     ;(regions[row.page] ??= []).push(region)

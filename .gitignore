@@ -34,3 +34,6 @@ pnpm-debug.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# tesseract.js runtime, copied out of node_modules by scripts/copy-tesseract-assets.mjs
+/public/tesseract/

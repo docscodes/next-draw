@@ -2,12 +2,16 @@
 
 import {
   AlertTriangle,
+  Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  Copy,
   Eraser,
   Loader2,
   ScanText,
   SquareDashed,
+  TextSearch,
   X,
 } from "lucide-react"
 import type { LucideIcon } from "lucide-react"
@@ -19,10 +23,16 @@ import type {
 } from "pdfjs-dist"
 
 import { Button } from "@/components/ui/button"
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible"
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
 import type { PageRegions, Region, RegionKind } from "@/lib/annotations"
-import { deleteRegions, saveRegion } from "../actions"
+import { readRegion, stopOcr } from "@/lib/ocr"
+import { deleteRegions, saveRegion, saveRegionText } from "../actions"
 
 /** Widest the page is drawn, so single-page plans stay readable on 4K screens. */
 const MAX_PAGE_WIDTH = 1400
@@ -116,10 +126,30 @@ const FloorplanViewer = ({
   const [saveError, setSaveError] = useState<string | null>(regionsError)
   /** How many writes are still in flight. */
   const [writes, setWrites] = useState(0)
+  /** Ids of the capture rectangles OCR is working through right now. */
+  const [reading, setReading] = useState<ReadonlySet<string>>(new Set())
+  /** Why the last read failed, if it did. */
+  const [ocrError, setOcrError] = useState<string | null>(null)
+  const [showText, setShowText] = useState(true)
+  const [copied, setCopied] = useState(false)
 
   const pages = doc?.numPages ?? 0
   const pageRegions = regions[page] ?? []
   const handles = HANDLES[mode ? "marking" : "reading"]
+  const captured = pageRegions.filter((region) => region.kind === "capture")
+  const pageText = captured
+    .map((region) => region.text)
+    .filter(Boolean)
+    .join("\n\n")
+
+  /** Latest regions, for reads started from a handler's stale closure. */
+  const regionsRef = useRef(regions)
+  useEffect(() => {
+    regionsRef.current = regions
+  }, [regions])
+
+  // The OCR engine holds a WebAssembly heap, so it is shut down with the view.
+  useEffect(() => () => void stopOcr(), [])
 
   const goTo = useCallback(
     (next: number) => {
@@ -272,6 +302,7 @@ const FloorplanViewer = ({
   /**
    * Applies a change to the page straight away and sends it to Supabase. A
    * rejected write is undone, so what is drawn always matches what is stored.
+   * Answers whether the change stuck.
    */
   const write = async (
     send: () => Promise<{ error: string | null }>,
@@ -283,12 +314,14 @@ const FloorplanViewer = ({
       if (error) {
         setSaveError(error)
         undo()
-      } else {
-        setSaveError(null)
+        return false
       }
+      setSaveError(null)
+      return true
     } catch (cause) {
       setSaveError(cause instanceof Error ? cause.message : "Could not save")
       undo()
+      return false
     } finally {
       setWrites((count) => count - 1)
     }
@@ -306,13 +339,91 @@ const FloorplanViewer = ({
       [on]: (current[on] ?? []).filter((region) => !ids.has(region.id)),
     }))
 
-  const createRegion = (region: Region) => {
+  const patchRegion = (on: number, id: string, patch: Partial<Region>) =>
+    setRegions((current) => ({
+      ...current,
+      [on]: (current[on] ?? []).map((region) =>
+        region.id === id ? { ...region, ...patch } : region
+      ),
+    }))
+
+  const markReading = (ids: string[], busy: boolean) =>
+    setReading((current) => {
+      const next = new Set(current)
+      for (const id of ids) {
+        if (busy) next.add(id)
+        else next.delete(id)
+      }
+      return next
+    })
+
+  /**
+   * Reads capture rectangles with the OCR engine in this browser and stores
+   * what it found. They are read one at a time: the engine is single-threaded,
+   * so a batch would only queue up inside it anyway.
+   */
+  const read = async (on: number, targets: Region[]) => {
+    if (!doc || targets.length === 0) return
+
+    // Read against the marks as they stand now, not as this handler saw them.
+    const ignored = (regionsRef.current[on] ?? []).filter(
+      (region) => region.kind === "ignore"
+    )
+
+    setOcrError(null)
+    markReading(
+      targets.map((region) => region.id),
+      true
+    )
+
+    try {
+      const pdfPage = await doc.getPage(on)
+
+      for (const region of targets) {
+        try {
+          const found = await readRegion(pdfPage, region, ignored)
+          patchRegion(on, region.id, found)
+
+          void write(
+            () => saveRegionText(path, region.id, found.text, found.confidence),
+            () =>
+              patchRegion(on, region.id, {
+                text: region.text ?? null,
+                confidence: region.confidence ?? null,
+              })
+          )
+        } catch (cause) {
+          // One unreadable rectangle should not stop the rest of the batch.
+          setOcrError(
+            cause instanceof Error ? cause.message : "Could not read this area"
+          )
+        } finally {
+          markReading([region.id], false)
+        }
+      }
+    } catch (cause) {
+      setOcrError(
+        cause instanceof Error ? cause.message : "Could not read this page"
+      )
+    } finally {
+      markReading(
+        targets.map((region) => region.id),
+        false
+      )
+    }
+  }
+
+  const createRegion = async (region: Region) => {
     const on = page
     addRegion(on, region)
-    void write(
+
+    const stored = await write(
       () => saveRegion(path, on, region),
       () => dropRegions(on, new Set([region.id]))
     )
+
+    // Text is read straight away, but only once the row it lands on exists.
+    if (stored && region.kind === "capture") await read(on, [region])
   }
 
   const removeRegions = (removed: Region[]) => {
@@ -412,6 +523,21 @@ const FloorplanViewer = ({
             </Button>
           )
         })}
+        {captured.length > 0 && (
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={!doc || reading.size > 0}
+            onClick={() => void read(page, captured)}
+          >
+            {reading.size > 0 ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <TextSearch className="size-4" />
+            )}
+            Read {captured.length}
+          </Button>
+        )}
         {pageRegions.length > 0 && (
           <Button
             size="sm"
@@ -440,6 +566,15 @@ const FloorplanViewer = ({
           <p>
             <span className="font-medium">Marks are not being saved.</span>{" "}
             {saveError}
+          </p>
+        </div>
+      )}
+      {ocrError && (
+        <div className="flex items-start gap-2 border-b border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+          <p>
+            <span className="font-medium">Text could not be read.</span>{" "}
+            {ocrError}
           </p>
         </div>
       )}
@@ -502,7 +637,7 @@ const FloorplanViewer = ({
                     drawn.h * box.height < MIN_REGION_PX
                   )
                     return
-                  createRegion({ ...drawn, id: crypto.randomUUID() })
+                  void createRegion({ ...drawn, id: crypto.randomUUID() })
                 }}
                 onPointerCancel={cancelDrag}
               />
@@ -512,6 +647,7 @@ const FloorplanViewer = ({
               {pageRegions.map((region) => (
                 <div
                   key={region.id}
+                  title={region.text ?? undefined}
                   className={`group absolute border-2 ${handles.mark} ${KINDS[region.kind].box}`}
                   style={{
                     left: `${region.x * 100}%`,
@@ -550,6 +686,77 @@ const FloorplanViewer = ({
           </div>
         )}
       </div>
+      {captured.length > 0 && (
+        <Collapsible
+          open={showText}
+          onOpenChange={setShowText}
+          className="border-t bg-background"
+        >
+          <div className="flex items-center gap-1 px-3 py-1.5">
+            <CollapsibleTrigger asChild>
+              <Button size="sm" variant="ghost" className="-ml-2">
+                <ChevronDown
+                  className={`size-4 transition-transform ${showText ? "" : "-rotate-90"}`}
+                />
+                Captured text
+                <span className="text-muted-foreground">{captured.length}</span>
+              </Button>
+            </CollapsibleTrigger>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={!pageText}
+              onClick={() => {
+                void navigator.clipboard.writeText(pageText).then(() => {
+                  setCopied(true)
+                  setTimeout(() => setCopied(false), 2000)
+                })
+              }}
+            >
+              {copied ? (
+                <Check className="size-4" />
+              ) : (
+                <Copy className="size-4" />
+              )}
+              {copied ? "Copied" : "Copy"}
+            </Button>
+          </div>
+          <CollapsibleContent>
+            <ol className="max-h-56 overflow-auto border-t px-3 py-1 text-sm">
+              {captured.map((region, index) => (
+                <li key={region.id} className="flex gap-3 py-1.5">
+                  <span className="w-5 shrink-0 text-right text-xs leading-6 text-muted-foreground tabular-nums">
+                    {index + 1}
+                  </span>
+                  {reading.has(region.id) ? (
+                    <span className="flex flex-1 items-center gap-2 leading-6 text-muted-foreground">
+                      <Loader2 className="size-3.5 animate-spin" />
+                      Reading…
+                    </span>
+                  ) : region.text ? (
+                    <p className="min-w-0 flex-1 leading-6 whitespace-pre-wrap">
+                      {region.text}
+                    </p>
+                  ) : (
+                    <p className="flex-1 leading-6 text-muted-foreground">
+                      {typeof region.confidence === "number"
+                        ? "No text found"
+                        : "Not read yet"}
+                    </p>
+                  )}
+                  {!reading.has(region.id) &&
+                    region.text &&
+                    typeof region.confidence === "number" && (
+                      <span className="shrink-0 text-xs leading-6 text-muted-foreground tabular-nums">
+                        {Math.round(region.confidence)}%
+                      </span>
+                    )}
+                </li>
+              ))}
+            </ol>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
     </div>
   )
 }

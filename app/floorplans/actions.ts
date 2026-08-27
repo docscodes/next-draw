@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache"
 
 import {
   ANNOTATIONS_TABLE,
+  MAX_TEXT_LENGTH,
   isRegion,
   reasonForTable,
   toRow,
@@ -138,6 +139,39 @@ export async function saveRegion(
       .from(ANNOTATIONS_TABLE)
       // Re-saving the same id is a no-op, so a retried write cannot duplicate.
       .upsert(toRow(objectPath, page, region))
+
+    return error ? { error: reasonForTable(error.message, error.code) } : ok
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : "Could not save" }
+  }
+}
+
+/**
+ * Stores what OCR read out of one capture rectangle. Scoped to the floorplan
+ * and to `capture`, so a stray id cannot write text onto an ignored area.
+ */
+export async function saveRegionText(
+  objectPath: string,
+  id: string,
+  text: string,
+  confidence: number
+): Promise<SaveState> {
+  if (!objectPath) return { error: "Missing floorplan" }
+  if (!id) return { error: "Missing region" }
+
+  try {
+    const { error } = await getSupabase()
+      .from(ANNOTATIONS_TABLE)
+      .update({
+        text: text.slice(0, MAX_TEXT_LENGTH),
+        confidence: Number.isFinite(confidence)
+          ? Math.min(Math.max(confidence, 0), 100)
+          : null,
+        read_at: new Date().toISOString(),
+      })
+      .eq("object_path", objectPath)
+      .eq("id", id)
+      .eq("kind", "capture")
 
     return error ? { error: reasonForTable(error.message, error.code) } : ok
   } catch (error) {
